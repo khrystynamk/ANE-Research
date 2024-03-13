@@ -5,42 +5,6 @@ from PIL import Image
 import ssl
 ssl._create_default_https_context = ssl._create_unverified_context
 
-# def add_activation_layer(model: ct.models.MLModel):
-#     spec = model.get_spec()
-#     nn = getattr(spec, spec.WhichOneof('Type'))
-#     spec_layers = nn.layers
-#     output_layers = []
-#     for layer in spec_layers:
-#         if layer.name[:2] == "25":
-#             print("name: %s input: %s output: %s" % (layer.name, layer.input, layer.output))
-#             output_layers.append(layer)
-#     new_layers = []
-#     layernum = 0
-#     for layer in output_layers:
-#         new_layer = spec_layers.add()
-#         new_layer.name = 'out_p'+str(layernum)
-#         new_layers.append('out_p'+str(layernum))
-#         new_layer.activation.linear.alpha=255
-#         new_layer.activation.linear.beta=0
-#         new_layer.input.append('var_'+layer.name)
-#         new_layer.output.append('out_p'+str(layernum))
-#         output_description = next(x for x in spec.description.output if x.name==output_layers[layernum].output[0])
-#         output_description.name = new_layer.name
-#         layernum = layernum + 1
-#     # Make output GrayScale image.
-    
-#     for output in spec.description.output:
-#         if output.name not in new_layers:
-#             continue
-#         if output.type.WhichOneof('Type') != 'multiArrayType':
-#             raise ValueError("%s is not a multiarray type" % output.name)
-#         # output.type.imageType.colorSpace = ft.ImageFeatureType.ColorSpace.Value('GRAYSCALE')
-#         output.type.imageType.width = 320
-#         output.type.imageType.height = 320
-#     # save updated model.
-#     updated_model = ct.models.MLModel(spec)
-#     updated_model.save("u2net.mlmodel")
-
 def convert_u2net():
     net_model = U2NET(3, 1)
     net_model.eval()
@@ -79,4 +43,4 @@ def example_run(model: ct.models.MLModel, img_path: str):
 
 if __name__ == "__main__":
     mlmodel = convert_u2net()
-    example_run(mlmodel, "/Users/khrystynamysak/Documents/UCU APPS/APPS_ACS/ANE-Research/daisy.jpg")
+    example_run(mlmodel, "daisy.jpg")
