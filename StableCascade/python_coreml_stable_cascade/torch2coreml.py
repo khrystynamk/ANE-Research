@@ -7,13 +7,12 @@
 # meaning that it is possible to encode a 512x512 image to 12x12.
 # https://github.com/huggingface/diffusers/blob/1c60e094de0b4f86e7bf13009f4d49a27073b9f5/src/diffusers/pipelines/stable_cascade/pipeline_stable_cascade_combined.py#L157
 # https://huggingface.co/stabilityai/stable-cascade
-
 COMPRESSION_FACTOR = 42
 SAMPLE_SIZE = 512 / COMPRESSION_FACTOR
 
-from python_coreml_stable_cascade import (
-    unet, controlnet, chunk_mlprogram
-)
+from python_coreml_stable_cascade.stable_cascade_unet import StableCascadeUNet
+import python_coreml_stable_cascade.chunk_mlprogram
+# import stable_cascade_unet, chunk_mlprogram
 
 import argparse
 from collections import OrderedDict, defaultdict
@@ -22,7 +21,7 @@ import coremltools as ct
 from diffusers import (
     StableCascadeCombinedPipeline
 )
-from diffusers.models import StableCascadeUNet
+# from diffusers.models import StableCascadeUNet
 import gc
 
 import logging
@@ -555,216 +554,384 @@ def convert_vqgan_decoder(pipe, args):
     del traced_vqgan_decoder, pipe.vqgan.out_block, coreml_vqgan_decoder
     gc.collect()
 
-# def convert_decoder(pipe, args, model_name = None):
-#     """ Converts the UNet component of Stable Diffusion
+
+def convert_decoder(pipe, args, model_name = None):
+    """ Converts the UNet component of Stable Diffusion
+    """
+    decoder_name = model_name or "prior_prior"
+
+    out_path = _get_out_path(args, decoder_name)
+
+    # Check if Unet was previously exported and then chunked
+    decoder_chunks_exist = all(
+        os.path.exists(out_path.replace(".mlpackage", f"_chunk{idx+1}.mlpackage"))
+        for idx in range(2))
+
+    if args.chunk_decoder and decoder_chunks_exist:
+        logger.info("`decoder` chunks already exist, skipping conversion.")
+        del pipe.prior_prior
+        gc.collect()
+        return
+
+    # If original Unet does not exist, export it from PyTorch+diffusers
+    if not os.path.exists(out_path):
+        # Prepare sample input shapes and values
+        batch_size = 2  # for classifier-free guidance
+        sample_shape = (
+            batch_size,                       # B
+            pipe.prior_prior.config.in_channels,  # C
+            args.latent_h or round(SAMPLE_SIZE),     # H
+            args.latent_w or round(SAMPLE_SIZE),     # W
+        )
+
+        if not hasattr(pipe, "text_encoder"):
+            raise RuntimeError(
+                "convert_text_encoder() deletes pipe.text_encoder to save RAM. "
+                "Please use convert_unet() before convert_text_encoder()")
+
+        if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
+            text_token_sequence_length = pipe.text_encoder.config.max_position_embeddings
+            hidden_size = pipe.text_encoder.config.hidden_size
+
+        encoder_hidden_states_shape = (
+            batch_size,
+            args.text_encoder_hidden_size or round(SAMPLE_SIZE * COMPRESSION_FACTOR) or hidden_size,
+            1,
+            args.text_token_sequence_length or text_token_sequence_length,
+        )
+
+        # Create the scheduled timesteps for downstream use
+        DEFAULT_NUM_INFERENCE_STEPS = 30
+        pipe.scheduler.set_timesteps(DEFAULT_NUM_INFERENCE_STEPS)
+
+        sample_decoder_inputs = OrderedDict([
+            ("sample", torch.rand(*sample_shape)),
+            ("timestep",
+             torch.tensor([pipe.scheduler.timesteps[0].item()] *
+                          (batch_size)).to(torch.float32)),
+            ("encoder_hidden_states", torch.rand(*encoder_hidden_states_shape))
+        ])
+
+        # Prepare inputs
+        baseline_sample_decoder_inputs = deepcopy(sample_decoder_inputs)
+        baseline_sample_decoder_inputs[
+            "encoder_hidden_states"] = baseline_sample_decoder_inputs[
+                "encoder_hidden_states"].squeeze(2).transpose(1, 2)
+
+        # Initialize reference unet
+        # unet_cls = unet.UNet2DConditionModel
+        # decoder_cls = stable_cascade_unet.StableCascadeUNet
+        decoder_cls = StableCascadeUNet
+
+        reference_decoder = decoder_cls(**pipe.prior_prior.config).eval()
+
+        # load_state_dict_summary = reference_unet.load_state_dict(
+        #     pipe.unet.state_dict())
+
+        # if args.unet_support_controlnet:
+        #     from .unet import calculate_conv2d_output_shape
+        #     additional_residuals_shapes = []
+
+        #     # conv_in
+        #     out_h, out_w = calculate_conv2d_output_shape(
+        #         (args.latent_h or pipe.unet.config.sample_size),
+        #         (args.latent_w or pipe.unet.config.sample_size),
+        #         reference_unet.conv_in,
+        #     )
+        #     additional_residuals_shapes.append(
+        #         (batch_size, reference_unet.conv_in.out_channels, out_h, out_w))
+            
+        #     # down_blocks
+        #     for down_block in reference_unet.down_blocks:
+        #         additional_residuals_shapes += [
+        #             (batch_size, resnet.out_channels, out_h, out_w) for resnet in down_block.resnets
+        #         ]
+        #         if hasattr(down_block, "downsamplers") and down_block.downsamplers is not None:
+        #             for downsampler in down_block.downsamplers:
+        #                 out_h, out_w = calculate_conv2d_output_shape(out_h, out_w, downsampler.conv)
+        #             additional_residuals_shapes.append(
+        #                 (batch_size, down_block.downsamplers[-1].conv.out_channels, out_h, out_w))
+            
+        #     # mid_block
+        #     additional_residuals_shapes.append(
+        #         (batch_size, reference_unet.mid_block.resnets[-1].out_channels, out_h, out_w)
+        #     )
+
+        #     baseline_sample_unet_inputs["down_block_additional_residuals"] = ()
+        #     for i, shape in enumerate(additional_residuals_shapes):
+        #         sample_residual_input = torch.rand(*shape)
+        #         sample_decoder_inputs[f"additional_residual_{i}"] = sample_residual_input
+        #         if i == len(additional_residuals_shapes) - 1:
+        #             baseline_sample_unet_inputs["mid_block_additional_residual"] = sample_residual_input
+        #         else:
+        #             baseline_sample_unet_inputs["down_block_additional_residuals"] += (sample_residual_input, )
+
+        sample_decoder_inputs_spec = {
+            k: (v.shape, v.dtype)
+            for k, v in sample_decoder_inputs.items()
+        }
+        logger.info(f"Sample decoder inputs spec: {sample_decoder_inputs_spec}")
+
+        # JIT trace
+        logger.info("JIT tracing..")
+        reference_decoder = torch.jit.trace(reference_decoder,
+                                         list(sample_decoder_inputs.values()))
+        logger.info("Done.")
+
+        if args.check_output_correctness:
+            baseline_out = pipe.prior_prior.to(torch.float32)(**baseline_sample_decoder_inputs,
+                                     return_dict=False)[0].numpy()
+            reference_out = reference_decoder(*sample_decoder_inputs.values())[0].numpy()
+            report_correctness(baseline_out, reference_out,
+                               "decoder baseline to reference PyTorch")
+
+        del pipe.prior_prior
+        gc.collect()
+
+        coreml_sample_decoder_inputs = {
+            k: v.numpy().astype(np.float16)
+            for k, v in sample_decoder_inputs.items()
+        }
+
+
+        coreml_decoder, out_path = _convert_to_coreml(decoder_name, reference_decoder,
+                                                   coreml_sample_decoder_inputs,
+                                                   ["noise_pred"], args)
+        del reference_decoder
+        gc.collect()
+
+        # Set model metadata
+        coreml_decoder.author = f"Please refer to the Model Card available at huggingface.co/{args.model_version}"
+        # if args.xl_version:
+        #     coreml_decoder.license = "OpenRAIL++-M (https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/blob/main/LICENSE.md)"
+        coreml_decoder.license = "OpenRAIL (https://huggingface.co/stabilityai/stable-cascade/blob/main/LICENSE)"
+        coreml_decoder.version = args.model_version
+        coreml_decoder.short_description = \
+            "Stable Diffusion generates images conditioned on text or other images as input through the diffusion process. " \
+            "Please refer to https://openreview.net/forum?id=gU58d5QeGv for details."
+
+        # Set the input descriptions
+        coreml_decoder.input_description["sample"] = \
+            "The low resolution latent feature maps being denoised through reverse diffusion"
+        coreml_decoder.input_description["timestep"] = \
+            "A value emitted by the associated scheduler object to condition the model on a given noise schedule"
+        coreml_decoder.input_description["encoder_hidden_states"] = \
+            "Output embeddings from the associated text_encoder model to condition to generated image on text. " \
+            "A maximum of 77 tokens (~40 words) are allowed. Longer text is truncated. " \
+            "Shorter text does not reduce computation."
+        if args.xl_version:
+            coreml_decoder.input_description["time_ids"] = \
+                "Additional embeddings that if specified are added to the embeddings that are passed along to the UNet blocks."
+            coreml_decoder.input_description["text_embeds"] = \
+                "Additional embeddings from text_encoder_2 that if specified are added to the embeddings that are passed along to the UNet blocks."
+
+        # Set the output descriptions
+        coreml_decoder.output_description["noise_pred"] = \
+            "Same shape and dtype as the `sample` input. " \
+            "The predicted noise to facilitate the reverse diffusion (denoising) process"
+
+        # Set package version metadata
+        from python_coreml_stable_cascade._version import __version__
+        coreml_decoder.user_defined_metadata["com.github.apple.ml-stable-diffusion.version"] = __version__
+
+        coreml_decoder.save(out_path)
+        logger.info(f"Saved decoder into {out_path}")
+
+        # Parity check PyTorch vs CoreML
+        if args.check_output_correctness:
+            coreml_out = list(
+                coreml_decoder.predict(coreml_sample_decoder_inputs).values())[0]
+            report_correctness(baseline_out, coreml_out,
+                               "unet baseline PyTorch to reference CoreML")
+
+        del coreml_decoder
+        gc.collect()
+    else:
+        del pipe.prior_prior
+        gc.collect()
+        logger.info(
+            f"`decoder` already exists at {out_path}, skipping conversion.")
+
+    if args.chunk_decoder and not decoder_chunks_exist:
+        logger.info(f"Chunking {model_name} in two approximately equal MLModels")
+        args.mlpackage_path = out_path
+        args.remove_original = False
+        args.merge_chunks_in_pipeline_model = False
+        # chunk_mlprogram.main(args)
+        python_coreml_stable_cascade.chunk_mlprogram.main(args)
+
+# def _get_controlnet_base_model(controlnet_model_version):
+#     from huggingface_hub import model_info
+#     info = model_info(controlnet_model_version)
+#     return info.cardData.get("base_model", None)
+
+# def convert_controlnet(pipe, args):
+#     """ Converts each ControlNet for Stable Diffusion
 #     """
-#     if args.unet_support_controlnet:
-#         decoder_name = "control-unet"
-#     else:
-#         decoder_name = model_name or "decoder"
+#     if not hasattr(pipe, "unet"):
+#         raise RuntimeError(
+#             "convert_unet() deletes pipe.unet to save RAM. "
+#             "Please use convert_vae_encoder() before convert_unet()")
 
-#     out_path = _get_out_path(args, decoder_name)
-
-#     # Check if Unet was previously exported and then chunked
-#     decoder_chunks_exist = all(
-#         os.path.exists(out_path.replace(".mlpackage", f"_chunk{idx+1}.mlpackage"))
-#         for idx in range(2))
-
-#     if args.chunk_decoder and decoder_chunks_exist:
-#         logger.info("`decoder` chunks already exist, skipping conversion.")
-#         del pipe.decoder
-#         gc.collect()
-#         return
-
-#     # If original Unet does not exist, export it from PyTorch+diffusers
-#     if not os.path.exists(out_path):
-#         # Prepare sample input shapes and values
-#         batch_size = 2  # for classifier-free guidance
-#         sample_shape = (
-#             batch_size,                       # B
-#             pipe.decoder.config.in_channels,  # C
-#             args.latent_h or round(SAMPLE_SIZE),     # H
-#             args.latent_w or round(SAMPLE_SIZE),     # W
-#         )
-
-#         if not hasattr(pipe, "text_encoder"):
+#     if not hasattr(pipe, "text_encoder"):
 #             raise RuntimeError(
 #                 "convert_text_encoder() deletes pipe.text_encoder to save RAM. "
 #                 "Please use convert_unet() before convert_text_encoder()")
 
-#         if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
-#             text_token_sequence_length = pipe.text_encoder.config.max_position_embeddings
-#             hidden_size = pipe.text_encoder.config.hidden_size
+#     for i, controlnet_model_version in enumerate(args.convert_controlnet):
+#         base_model = _get_controlnet_base_model(controlnet_model_version)
 
-#         encoder_hidden_states_shape = (
-#             batch_size,
-#             args.text_encoder_hidden_size or round(SAMPLE_SIZE * COMPRESSION_FACTOR) or hidden_size,
-#             1,
-#             args.text_token_sequence_length or text_token_sequence_length,
+#         if base_model is None and args.model_version != "runwayml/stable-diffusion-v1-5":
+#             logger.warning(
+#                 f"The original ControlNet models were trained using Stable Diffusion v1.5. "
+#                 f"It is possible that model {args.model_version} is not compatible with controlnet.")
+#         if base_model is not None and base_model != args.model_version:
+#             raise RuntimeError(
+#                 f"ControlNet model {controlnet_model_version} was trained using "
+#                 f"Stable Diffusion model {base_model}.\n However, you specified "
+#                 f"version {args.model_version} in the command line. Please, use "
+#                 f"--model-version {base_model} to convert this model.")
+
+#         controlnet_model_name = controlnet_model_version.replace("/", "_")
+#         fname = f"ControlNet_{controlnet_model_name}.mlpackage"
+#         out_path = os.path.join(args.o, fname)
+
+#         if os.path.exists(out_path):
+#             logger.info(
+#                 f"`controlnet_{controlnet_model_name}` already exists at {out_path}, skipping conversion."
+#             )
+#             continue
+
+#         if i == 0:
+#             batch_size = 2  # for classifier-free guidance
+#             sample_shape = (
+#                 batch_size,                    # B
+#                 pipe.unet.config.in_channels,  # C
+#                 (args.latent_h or pipe.unet.config.sample_size),  # H
+#                 (args.latent_w or pipe.unet.config.sample_size),  # W
+#             )
+
+#             encoder_hidden_states_shape = (
+#                 batch_size,
+#                 args.text_encoder_hidden_size or pipe.text_encoder.config.hidden_size,
+#                 1,
+#                 args.text_token_sequence_length or pipe.text_encoder.config.max_position_embeddings,
+#             )
+
+#             controlnet_cond_shape = (
+#                 batch_size,                                           # B
+#                 3,                                                    # C
+#                 (args.latent_h or pipe.unet.config.sample_size) * 8,  # H
+#                 (args.latent_w or pipe.unet.config.sample_size) * 8,  # w
+#             )
+
+#             # Create the scheduled timesteps for downstream use
+#             DEFAULT_NUM_INFERENCE_STEPS = 50
+#             pipe.scheduler.set_timesteps(DEFAULT_NUM_INFERENCE_STEPS)
+
+#             # Prepare inputs
+#             sample_controlnet_inputs = OrderedDict([
+#                 ("sample", torch.rand(*sample_shape)),
+#                 ("timestep",
+#                 torch.tensor([pipe.scheduler.timesteps[0].item()] *
+#                              (batch_size)).to(torch.float32)),
+#                 ("encoder_hidden_states", torch.rand(*encoder_hidden_states_shape)),
+#                 ("controlnet_cond", torch.rand(*controlnet_cond_shape)),
+#             ])
+#             sample_controlnet_inputs_spec = {
+#                 k: (v.shape, v.dtype)
+#                 for k, v in sample_controlnet_inputs.items()
+#             }
+#             logger.info(
+#                 f"Sample ControlNet inputs spec: {sample_controlnet_inputs_spec}")
+
+#             baseline_sample_controlnet_inputs = deepcopy(sample_controlnet_inputs)
+#             baseline_sample_controlnet_inputs[
+#                 "encoder_hidden_states"] = baseline_sample_controlnet_inputs[
+#                     "encoder_hidden_states"].squeeze(2).transpose(1, 2)
+
+#         # Import controlnet model and initialize reference controlnet
+#         original_controlnet = ControlNetModel.from_pretrained(
+#             controlnet_model_version,
+#             use_auth_token=True
 #         )
+#         reference_controlnet = controlnet.ControlNetModel(**original_controlnet.config).eval()
+#         load_state_dict_summary = reference_controlnet.load_state_dict(
+#             original_controlnet.state_dict())
 
-#         # Create the scheduled timesteps for downstream use
-#         DEFAULT_NUM_INFERENCE_STEPS = 50
-#         pipe.scheduler.set_timesteps(DEFAULT_NUM_INFERENCE_STEPS)
-
-#         sample_decoder_inputs = OrderedDict([
-#             ("sample", torch.rand(*sample_shape)),
-#             ("timestep",
-#              torch.tensor([pipe.scheduler.timesteps[0].item()] *
-#                           (batch_size)).to(torch.float32)),
-#             ("encoder_hidden_states", torch.rand(*encoder_hidden_states_shape))
-#         ])
-
-#         # Prepare inputs
-#         baseline_sample_decoder_inputs = deepcopy(sample_decoder_inputs)
-#         baseline_sample_decoder_inputs[
-#             "encoder_hidden_states"] = baseline_sample_decoder_inputs[
-#                 "encoder_hidden_states"].squeeze(2).transpose(1, 2)
-
-#         # Initialize reference unet
-#         # unet_cls = unet.UNet2DConditionModel
-#         decoder_cls = StableCascadeUNet
-
-#         reference_decoder = decoder_cls(**pipe.decoder.config).eval()
-
-#         # load_state_dict_summary = reference_unet.load_state_dict(
-#         #     pipe.unet.state_dict())
-
-#         # if args.unet_support_controlnet:
-#         #     from .unet import calculate_conv2d_output_shape
-#         #     additional_residuals_shapes = []
-
-#         #     # conv_in
-#         #     out_h, out_w = calculate_conv2d_output_shape(
-#         #         (args.latent_h or pipe.unet.config.sample_size),
-#         #         (args.latent_w or pipe.unet.config.sample_size),
-#         #         reference_unet.conv_in,
-#         #     )
-#         #     additional_residuals_shapes.append(
-#         #         (batch_size, reference_unet.conv_in.out_channels, out_h, out_w))
-            
-#         #     # down_blocks
-#         #     for down_block in reference_unet.down_blocks:
-#         #         additional_residuals_shapes += [
-#         #             (batch_size, resnet.out_channels, out_h, out_w) for resnet in down_block.resnets
-#         #         ]
-#         #         if hasattr(down_block, "downsamplers") and down_block.downsamplers is not None:
-#         #             for downsampler in down_block.downsamplers:
-#         #                 out_h, out_w = calculate_conv2d_output_shape(out_h, out_w, downsampler.conv)
-#         #             additional_residuals_shapes.append(
-#         #                 (batch_size, down_block.downsamplers[-1].conv.out_channels, out_h, out_w))
-            
-#         #     # mid_block
-#         #     additional_residuals_shapes.append(
-#         #         (batch_size, reference_unet.mid_block.resnets[-1].out_channels, out_h, out_w)
-#         #     )
-
-#         #     baseline_sample_unet_inputs["down_block_additional_residuals"] = ()
-#         #     for i, shape in enumerate(additional_residuals_shapes):
-#         #         sample_residual_input = torch.rand(*shape)
-#         #         sample_decoder_inputs[f"additional_residual_{i}"] = sample_residual_input
-#         #         if i == len(additional_residuals_shapes) - 1:
-#         #             baseline_sample_unet_inputs["mid_block_additional_residual"] = sample_residual_input
-#         #         else:
-#         #             baseline_sample_unet_inputs["down_block_additional_residuals"] += (sample_residual_input, )
-
-#         sample_decoder_inputs_spec = {
-#             k: (v.shape, v.dtype)
-#             for k, v in sample_decoder_inputs.items()
-#         }
-#         logger.info(f"Sample decoder inputs spec: {sample_decoder_inputs_spec}")
+#         num_residuals = reference_controlnet.get_num_residuals()
+#         output_keys = [f"additional_residual_{i}" for i in range(num_residuals)]
 
 #         # JIT trace
 #         logger.info("JIT tracing..")
-#         reference_decoder = torch.jit.trace(reference_decoder,
-#                                          list(sample_decoder_inputs.values()))
+#         reference_controlnet = torch.jit.trace(reference_controlnet,
+#                                          list(sample_controlnet_inputs.values()))
 #         logger.info("Done.")
 
 #         if args.check_output_correctness:
-#             baseline_out = pipe.decoder.to(torch.float32)(**baseline_sample_decoder_inputs,
-#                                      return_dict=False)[0].numpy()
-#             reference_out = reference_decoder(*sample_decoder_inputs.values())[0].numpy()
-#             report_correctness(baseline_out, reference_out,
-#                                "decoder baseline to reference PyTorch")
+#             baseline_out = original_controlnet(**baseline_sample_controlnet_inputs,
+#                                      return_dict=False)
+#             reference_out = reference_controlnet(*sample_controlnet_inputs.values())
+#             report_correctness(
+#                 baseline_out[-1].numpy(),
+#                 reference_out[-1].numpy(),
+#                 f"{controlnet_model_name} baseline to reference PyTorch")
 
-#         del pipe.decoder
+#         del original_controlnet
 #         gc.collect()
 
-#         coreml_sample_decoder_inputs = {
+#         coreml_sample_controlnet_inputs = {
 #             k: v.numpy().astype(np.float16)
-#             for k, v in sample_decoder_inputs.items()
+#             for k, v in sample_controlnet_inputs.items()
 #         }
 
+#         coreml_controlnet, out_path = _convert_to_coreml(f"controlnet_{controlnet_model_name}", reference_controlnet,
+#                                                    coreml_sample_controlnet_inputs,
+#                                                    output_keys, args,
+#                                                    out_path=out_path)
 
-#         coreml_decoder, out_path = _convert_to_coreml(decoder_name, reference_decoder,
-#                                                    coreml_sample_decoder_inputs,
-#                                                    ["noise_pred"], args)
-#         del reference_decoder
+#         del reference_controlnet
 #         gc.collect()
 
-#         # Set model metadata
-#         coreml_decoder.author = f"Please refer to the Model Card available at huggingface.co/{args.model_version}"
-#         # if args.xl_version:
-#         #     coreml_decoder.license = "OpenRAIL++-M (https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/blob/main/LICENSE.md)"
-#         coreml_decoder.license = "OpenRAIL (https://huggingface.co/stabilityai/stable-cascade/blob/main/LICENSE)"
-#         coreml_decoder.version = args.model_version
-#         coreml_decoder.short_description = \
-#             "Stable Diffusion generates images conditioned on text or other images as input through the diffusion process. " \
-#             "Please refer to https://openreview.net/forum?id=gU58d5QeGv for details."
+#         coreml_controlnet.author = f"Please refer to the Model Card available at huggingface.co/{controlnet_model_version}"
+#         coreml_controlnet.license = "OpenRAIL (https://huggingface.co/spaces/CompVis/stable-diffusion-license)"
+#         coreml_controlnet.version = controlnet_model_version
+#         coreml_controlnet.short_description = \
+#             "ControlNet is a neural network structure to control diffusion models by adding extra conditions. " \
+#             "Please refer to https://arxiv.org/abs/2302.05543 for details."
 
 #         # Set the input descriptions
-#         coreml_decoder.input_description["sample"] = \
+#         coreml_controlnet.input_description["sample"] = \
 #             "The low resolution latent feature maps being denoised through reverse diffusion"
-#         coreml_decoder.input_description["timestep"] = \
+#         coreml_controlnet.input_description["timestep"] = \
 #             "A value emitted by the associated scheduler object to condition the model on a given noise schedule"
-#         coreml_decoder.input_description["encoder_hidden_states"] = \
+#         coreml_controlnet.input_description["encoder_hidden_states"] = \
 #             "Output embeddings from the associated text_encoder model to condition to generated image on text. " \
 #             "A maximum of 77 tokens (~40 words) are allowed. Longer text is truncated. " \
 #             "Shorter text does not reduce computation."
-#         if args.xl_version:
-#             coreml_decoder.input_description["time_ids"] = \
-#                 "Additional embeddings that if specified are added to the embeddings that are passed along to the UNet blocks."
-#             coreml_decoder.input_description["text_embeds"] = \
-#                 "Additional embeddings from text_encoder_2 that if specified are added to the embeddings that are passed along to the UNet blocks."
+#         coreml_controlnet.input_description["controlnet_cond"] = \
+#             "An additional input image for ControlNet to condition the generated images."
 
 #         # Set the output descriptions
-#         coreml_decoder.output_description["noise_pred"] = \
-#             "Same shape and dtype as the `sample` input. " \
-#             "The predicted noise to facilitate the reverse diffusion (denoising) process"
+#         for i in range(num_residuals):
+#             coreml_controlnet.output_description[f"additional_residual_{i}"] = \
+#                 "One of the outputs of each downsampling block in ControlNet. " \
+#                 "The value added to the corresponding resnet output in UNet."
 
-#         # Set package version metadata
-#         from python_coreml_stable_cascade._version import __version__
-#         coreml_decoder.user_defined_metadata["com.github.apple.ml-stable-diffusion.version"] = __version__
-
-#         coreml_decoder.save(out_path)
-#         logger.info(f"Saved decoder into {out_path}")
+#         coreml_controlnet.save(out_path)
+#         logger.info(f"Saved controlnet into {out_path}")
 
 #         # Parity check PyTorch vs CoreML
 #         if args.check_output_correctness:
-#             coreml_out = list(
-#                 coreml_decoder.predict(coreml_sample_decoder_inputs).values())[0]
-#             report_correctness(baseline_out, coreml_out,
-#                                "unet baseline PyTorch to reference CoreML")
+#             coreml_out = coreml_controlnet.predict(coreml_sample_controlnet_inputs)
+#             report_correctness(
+#                 baseline_out[-1].numpy(),
+#                 coreml_out[output_keys[-1]],
+#                 "controlnet baseline PyTorch to reference CoreML"
+#             )
 
-#         del coreml_decoder
+#         del coreml_controlnet
 #         gc.collect()
-#     else:
-#         del pipe.decoder
-#         gc.collect()
-#         logger.info(
-#             f"`decoder` already exists at {out_path}, skipping conversion.")
-
-#     if args.chunk_decoder and not decoder_chunks_exist:
-#         logger.info(f"Chunking {model_name} in two approximately equal MLModels")
-#         args.mlpackage_path = out_path
-#         args.remove_original = False
-#         args.merge_chunks_in_pipeline_model = False
-#         chunk_mlprogram.main(args)
-
-def _get_controlnet_base_model(controlnet_model_version):
-    from huggingface_hub import model_info
-    info = model_info(controlnet_model_version)
-    return info.cardData.get("base_model", None)
 
 def get_pipeline(args):
     model_version = args.model_version
@@ -789,11 +956,11 @@ def main(args):
     pipe = get_pipeline(args)
 
     # Register the selected attention implementation globally
-    unet.ATTENTION_IMPLEMENTATION_IN_EFFECT = unet.AttentionImplementations[
-        args.attention_implementation]
-    logger.info(
-        f"Attention implementation in effect: {unet.ATTENTION_IMPLEMENTATION_IN_EFFECT}"
-    )
+    # unet.ATTENTION_IMPLEMENTATION_IN_EFFECT = unet.AttentionImplementations[
+    #     args.attention_implementation]
+    # logger.info(
+    #     f"Attention implementation in effect: {unet.ATTENTION_IMPLEMENTATION_IN_EFFECT}"
+    # )
 
     # Convert models
     if args.convert_vqgan_decoder:
@@ -801,20 +968,15 @@ def main(args):
         convert_vqgan_decoder(pipe, args)
         logger.info("Converted vqgan_decoder")
 
-    if args.convert_controlnet:
-        logger.info("Converting controlnet")
-        convert_controlnet(pipe, args)
-        logger.info("Converted controlnet")
+    # if args.convert_controlnet:
+    #     logger.info("Converting controlnet")
+    #     convert_controlnet(pipe, args)
+    #     logger.info("Converted controlnet")
 
-    # if args.convert_decoder:
-    #     logger.info("Converting decoder")
-    #     convert_decoder(pipe, args)
-    #     logger.info("Converted decoder")
-    
-    # if args.convert_prior:
-    #     logger.info("Converting prior")
-    #     convert_decoder(pipe, args)
-    #     logger.info("Converted prior")
+    if args.convert_decoder:
+        logger.info("Converting decoder")
+        convert_decoder(pipe, args)
+        logger.info("Converted decoder")
 
     if args.convert_text_encoder and hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
         logger.info("Converting text_encoder")
@@ -839,8 +1001,7 @@ def parser_spec():
     # Select which models to export (All are needed for text-to-image pipeline to function)
     parser.add_argument("--convert-text-encoder", action="store_true")
     parser.add_argument("--convert-vqgan-decoder", action="store_true")
-    # parser.add_argument("--convert-decoder", action="store_true")
-    # parser.add_argument("--convert-prior", action="store_true")
+    parser.add_argument("--convert-decoder", action="store_true")
     parser.add_argument(
         "--convert-controlnet", 
         nargs="*",
@@ -885,12 +1046,12 @@ def parser_spec():
         help=
         "The hidden size for the text encoder. `Defaults to pipe.text_encoder.config.hidden_size`",
     )
-    parser.add_argument(
-        "--attention-implementation",
-        choices=tuple(ai for ai in unet.AttentionImplementations._member_names_),
-        default=unet.ATTENTION_IMPLEMENTATION_IN_EFFECT.name,
-        help="The enumerated implementations trade off between ANE and GPU performance",
-    )
+    # parser.add_argument(
+    #     "--attention-implementation",
+    #     choices=tuple(ai for ai in unet.AttentionImplementations._member_names_),
+    #     default=unet.ATTENTION_IMPLEMENTATION_IN_EFFECT.name,
+    #     help="The enumerated implementations trade off between ANE and GPU performance",
+    # )
     parser.add_argument(
         "-o",
         default=os.getcwd(),

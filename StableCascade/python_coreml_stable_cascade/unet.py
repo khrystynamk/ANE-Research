@@ -3,8 +3,8 @@
 # Copyright (C) 2022 Apple Inc. All Rights Reserved.
 #
 
-from python_coreml_stable_diffusion.layer_norm import LayerNormANE
-from python_coreml_stable_diffusion import attention
+from python_coreml_stable_cascade.layer_norm import LayerNormANE
+from python_coreml_stable_cascade import attention
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers import ModelMixin
@@ -1037,111 +1037,6 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
 
         return (sample, )
 
-
-class UNet2DConditionModelXL(UNet2DConditionModel):
-    """ UNet2DConditionModel variant for Stable Diffusion XL
-    with an extended forward() signature
-    """
-    def forward(
-        self,
-        sample,
-        timestep,
-        encoder_hidden_states,
-        time_ids,
-        text_embeds,
-        *additional_residuals,
-    ):
-        # 0. Project time embeddings
-        t_emb = self.time_proj(timestep)
-        emb = self.time_embedding(t_emb)
-
-        aug_emb = None
-
-        if self.config.addition_embed_type == "text":
-            raise NotImplementedError
-        elif self.config.addition_embed_type == "text_image":
-            raise NotImplementedError
-        elif self.config.addition_embed_type == "text_time":
-            assert time_ids is not None
-            assert text_embeds is not None
-
-            time_embeds = self.add_time_proj(time_ids.flatten())
-            time_embeds = time_embeds.reshape((text_embeds.shape[0], -1))
-
-            add_embeds = torch.concat([text_embeds, time_embeds], dim=-1)
-            aug_emb = self.add_embedding(add_embeds)
-        elif self.config.addition_embed_type == "image":
-            raise NotImplementedError
-        elif self.config.addition_embed_type == "image_hint":
-            raise NotImplementedError
-
-        emb = emb + aug_emb if aug_emb is not None else emb
-
-        # 1. center input if necessary
-        if self.config.center_input_sample:
-            sample = 2 * sample - 1.0
-
-        # 2. pre-process
-        sample = self.conv_in(sample)
-
-        # 3. down
-        down_block_res_samples = (sample, )
-        for downsample_block in self.down_blocks:
-            if hasattr(
-                    downsample_block,
-                    "attentions") and downsample_block.attentions is not None:
-                sample, res_samples = downsample_block(
-                    hidden_states=sample,
-                    temb=emb,
-                    encoder_hidden_states=encoder_hidden_states)
-            else:
-                sample, res_samples = downsample_block(hidden_states=sample,
-                                                       temb=emb)
-
-            down_block_res_samples += res_samples
-
-        if additional_residuals:
-            new_down_block_res_samples = ()
-            for i, down_block_res_sample in enumerate(down_block_res_samples):
-                down_block_res_sample = down_block_res_sample + additional_residuals[i]
-                new_down_block_res_samples += (down_block_res_sample,)
-            down_block_res_samples = new_down_block_res_samples
-
-        # 4. mid
-        sample = self.mid_block(sample,
-                                emb,
-                                encoder_hidden_states=encoder_hidden_states)
-        
-        if additional_residuals:
-            sample = sample + additional_residuals[-1]
-
-        # 5. up
-        for upsample_block in self.up_blocks:
-            res_samples = down_block_res_samples[-len(upsample_block.resnets):]
-            down_block_res_samples = down_block_res_samples[:-len(
-                upsample_block.resnets)]
-
-            if hasattr(upsample_block,
-                       "attentions") and upsample_block.attentions is not None:
-                sample = upsample_block(
-                    hidden_states=sample,
-                    temb=emb,
-                    res_hidden_states_tuple=res_samples,
-                    encoder_hidden_states=encoder_hidden_states,
-                )
-            else:
-                sample = upsample_block(hidden_states=sample,
-                                        temb=emb,
-                                        res_hidden_states_tuple=res_samples)
-
-        # 6. post-process
-        sample = self.conv_norm_out(sample)
-        sample = self.conv_act(sample)
-        sample = self.conv_out(sample)
-
-        return (sample, )
-
-
 def get_down_block(
     down_block_type,
     num_layers,
@@ -1233,6 +1128,7 @@ def get_up_block(
             transformer_layers_per_block=transformer_layers_per_block,
         )
     raise ValueError(f"{up_block_type} does not exist.")
+
 
 def calculate_conv2d_output_shape(in_h, in_w, conv2d_layer):
     k_h, k_w = conv2d_layer.kernel_size
