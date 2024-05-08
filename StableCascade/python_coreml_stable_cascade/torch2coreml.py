@@ -593,11 +593,10 @@ def convert_decoder(pipe, args, model_name = None):
             text_token_sequence_length = pipe.text_encoder.config.max_position_embeddings
             hidden_size = pipe.text_encoder.config.hidden_size
 
-        encoder_hidden_states_shape = (
+        clip_text_pooled_shape = (
             batch_size,
-            args.text_encoder_hidden_size or round(SAMPLE_SIZE * COMPRESSION_FACTOR) or hidden_size,
             1,
-            args.text_token_sequence_length or text_token_sequence_length,
+            args.text_encoder_hidden_size or hidden_size,
         )
 
         # Create the scheduled timesteps for downstream use
@@ -609,14 +608,14 @@ def convert_decoder(pipe, args, model_name = None):
             ("timestep",
              torch.tensor([pipe.scheduler.timesteps[0].item()] *
                           (batch_size)).to(torch.float32)),
-            ("encoder_hidden_states", torch.rand(*encoder_hidden_states_shape))
+            ("clip_text_pooled", torch.rand(*clip_text_pooled_shape))
         ])
 
         # Prepare inputs
-        baseline_sample_decoder_inputs = deepcopy(sample_decoder_inputs)
-        baseline_sample_decoder_inputs[
-            "encoder_hidden_states"] = baseline_sample_decoder_inputs[
-                "encoder_hidden_states"].squeeze(2).transpose(1, 2)
+        # baseline_sample_decoder_inputs = deepcopy(sample_decoder_inputs)
+        # baseline_sample_decoder_inputs[
+        #     "encoder_hidden_states"] = baseline_sample_decoder_inputs[
+        #         "encoder_hidden_states"].squeeze(2).transpose(1, 2)
 
         # Initialize reference unet
         # unet_cls = unet.UNet2DConditionModel
@@ -678,12 +677,12 @@ def convert_decoder(pipe, args, model_name = None):
                                          list(sample_decoder_inputs.values()))
         logger.info("Done.")
 
-        if args.check_output_correctness:
-            baseline_out = pipe.prior_prior.to(torch.float32)(**baseline_sample_decoder_inputs,
-                                     return_dict=False)[0].numpy()
-            reference_out = reference_decoder(*sample_decoder_inputs.values())[0].numpy()
-            report_correctness(baseline_out, reference_out,
-                               "decoder baseline to reference PyTorch")
+        # if args.check_output_correctness:
+        #     baseline_out = pipe.prior_prior.to(torch.float32)(**baseline_sample_decoder_inputs,
+        #                              return_dict=False)[0].numpy()
+        #     reference_out = reference_decoder(*sample_decoder_inputs.values())[0].numpy()
+        #     report_correctness(baseline_out, reference_out,
+        #                        "decoder baseline to reference PyTorch")
 
         del pipe.prior_prior
         gc.collect()
@@ -715,15 +714,15 @@ def convert_decoder(pipe, args, model_name = None):
             "The low resolution latent feature maps being denoised through reverse diffusion"
         coreml_decoder.input_description["timestep"] = \
             "A value emitted by the associated scheduler object to condition the model on a given noise schedule"
-        coreml_decoder.input_description["encoder_hidden_states"] = \
+        coreml_decoder.input_description["clip_text_pooled"] = \
             "Output embeddings from the associated text_encoder model to condition to generated image on text. " \
             "A maximum of 77 tokens (~40 words) are allowed. Longer text is truncated. " \
             "Shorter text does not reduce computation."
-        if args.xl_version:
-            coreml_decoder.input_description["time_ids"] = \
-                "Additional embeddings that if specified are added to the embeddings that are passed along to the UNet blocks."
-            coreml_decoder.input_description["text_embeds"] = \
-                "Additional embeddings from text_encoder_2 that if specified are added to the embeddings that are passed along to the UNet blocks."
+        # if args.xl_version:
+        #     coreml_decoder.input_description["time_ids"] = \
+        #         "Additional embeddings that if specified are added to the embeddings that are passed along to the UNet blocks."
+        #     coreml_decoder.input_description["text_embeds"] = \
+        #         "Additional embeddings from text_encoder_2 that if specified are added to the embeddings that are passed along to the UNet blocks."
 
         # Set the output descriptions
         coreml_decoder.output_description["noise_pred"] = \
