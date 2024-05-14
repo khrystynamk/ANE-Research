@@ -1,7 +1,34 @@
-#
-# For licensing see accompanying LICENSE.md file.
-# Copyright (C) 2022 Apple Inc. All Rights Reserved.
-#
+"""
+Script for converting Stable Cascade to CoreMl.
+"""
+import os
+import logging
+import argparse
+import re
+import shutil
+import time
+from copy import deepcopy
+from collections import OrderedDict
+import gc
+
+import numpy as np
+import requests
+
+import torch
+
+import coremltools as ct
+from diffusers import StableCascadeCombinedPipeline
+import python_coreml_stable_cascade.chunk_mlprogram
+from python_coreml_stable_cascade.stable_cascade_unet import StableCascadeUNet
+
+from transformers.models.clip import modeling_clip
+
+
+logging.basicConfig()
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+torch.set_grad_enabled(False)
 
 # Default size of the image is 512 and Stable Cascade achieves a compression factor of 42,
 # meaning that it is possible to encode a 512x512 image to 12x12.
@@ -10,44 +37,11 @@
 COMPRESSION_FACTOR = 42
 SAMPLE_SIZE = 512 / COMPRESSION_FACTOR
 
-from python_coreml_stable_cascade.stable_cascade_unet import StableCascadeUNet
-import python_coreml_stable_cascade.chunk_mlprogram
-# import stable_cascade_unet, chunk_mlprogram
-
-import argparse
-from collections import OrderedDict, defaultdict
-from copy import deepcopy
-import coremltools as ct
-from diffusers import (
-    StableCascadeCombinedPipeline
-)
-# from diffusers.models import StableCascadeUNet
-import gc
-
-import logging
-
-logging.basicConfig()
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
-import numpy as np
-import os
-import requests
-import shutil
-import time
-import re
-import pathlib
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-torch.set_grad_enabled(False)
-
-from types import MethodType
+DEFAULT_NUM_INFERENCE_STEPS = 30
+ABSOLUTE_MIN_PSNR = 35
 
 
-def _get_coreml_inputs(sample_inputs, args):
+def _get_coreml_inputs(sample_inputs):
     return [
         ct.TensorType(
             name=k,
@@ -58,7 +52,8 @@ def _get_coreml_inputs(sample_inputs, args):
 
 
 def compute_psnr(a, b):
-    """ Compute Peak-Signal-to-Noise-Ratio across two numpy.ndarray objects
+    """
+    Compute Peak-Signal-to-Noise-Ratio across two numpy.ndarray objects.
     """
     max_b = np.abs(b).max()
     sumdeltasq = 0.0
@@ -75,11 +70,9 @@ def compute_psnr(a, b):
     return psnr
 
 
-ABSOLUTE_MIN_PSNR = 35
-
-
 def report_correctness(original_outputs, final_outputs, log_prefix):
-    """ Report PSNR values across two compatible tensors
+    """
+    Report PSNR values across two compatible tensors.
     """
     original_psnr = compute_psnr(original_outputs, original_outputs)
     final_psnr = compute_psnr(original_outputs, final_outputs)
@@ -96,6 +89,7 @@ def report_correctness(original_outputs, final_outputs, log_prefix):
             f"{final_psnr:.1f} dB > {ABSOLUTE_MIN_PSNR} dB (minimum allowed) parity check passed"
         )
     return final_psnr
+
 
 def _get_out_path(args, submodule_name):
     fname = f"Stable_Cascade_version_{args.model_version}_{submodule_name}.mlpackage"
@@ -116,13 +110,14 @@ def _convert_to_coreml(submodule_name, torchscript_module, sample_inputs,
         logger.info(f"Loading model from {out_path}")
 
         start = time.time()
-        # Note: Note that each model load will trigger a model compilation which takes up to a few minutes.
-        # The Swifty CLI we provide uses precompiled Core ML models (.mlmodelc) which incurs compilation only
-        # upon first load and mitigates the load time in subsequent runs.
+        # Note: Note that each model load will trigger a model compilation which takes
+        # up to a few minutes.
+        # The Swifty CLI we provide uses precompiled Core ML models (.mlmodelc) which
+        # incurs compilation only upon first load and mitigates the load time in
+        # subsequent runs.
         coreml_model = ct.models.MLModel(
             out_path, compute_units=compute_unit)
-        logger.info(
-            f"Loading {out_path} took {time.time() - start:.1f} seconds")
+        logger.info(f"Loading {out_path} took {time.time() - start:.1f} seconds")
 
         coreml_model.compute_unit = compute_unit
     else:
@@ -131,7 +126,7 @@ def _convert_to_coreml(submodule_name, torchscript_module, sample_inputs,
             torchscript_module,
             convert_to="mlprogram",
             minimum_deployment_target=ct.target.macOS14,
-            inputs=_get_coreml_inputs(sample_inputs, args),
+            inputs=_get_coreml_inputs(sample_inputs),
             outputs=[ct.TensorType(name=name, dtype=np.float32) for name in output_names],
             compute_units=compute_unit,
             compute_precision=precision,
@@ -145,9 +140,10 @@ def _convert_to_coreml(submodule_name, torchscript_module, sample_inputs,
 
 
 def quantize_weights(args):
-    """ Quantize weights to args.quantize_nbits using a palette (look-up table)
     """
-    for model_name in ["text_encoder", "text_encoder_2", "unet", "refiner", "control-unet"]:
+    Quantize weights to args.quantize_nbits using a palette (look-up table).
+    """
+    for model_name in ["text_encoder", "prior", "decoder"]:
         logger.info(f"Quantizing {model_name} to {args.quantize_nbits}-bit precision")
         out_path = _get_out_path(args, model_name)
         _quantize_weights(
@@ -156,23 +152,12 @@ def quantize_weights(args):
             args.quantize_nbits
         )
 
-    if args.convert_controlnet:
-        for controlnet_model_version in args.convert_controlnet:
-            controlnet_model_name = controlnet_model_version.replace("/", "_")
-            logger.info(f"Quantizing {controlnet_model_name} to {args.quantize_nbits}-bit precision")
-            fname = f"ControlNet_{controlnet_model_name}.mlpackage"
-            out_path = os.path.join(args.o, fname)
-            _quantize_weights(
-                out_path,
-                controlnet_model_name,
-                args.quantize_nbits
-            )
 
 def _quantize_weights(out_path, model_name, nbits):
     if os.path.exists(out_path):
         logger.info(f"Quantizing {model_name}")
         mlmodel = ct.models.MLModel(out_path,
-                                    compute_units=ct.ComputeUnit.CPU_ONLY)
+                                    compute_units=ct.ComputeUnit.ALL)
 
         op_config = ct.optimize.coreml.OpPalettizerConfig(
             mode="kmeans",
@@ -194,7 +179,8 @@ def _quantize_weights(out_path, model_name, nbits):
 
 
 def _compile_coreml_model(source_model_path, output_dir, final_name):
-    """ Compiles Core ML models using the coremlcompiler utility from Xcode toolchain
+    """
+    Compiles Core ML models using the coremlcompiler utility from Xcode toolchain.
     """
     target_path = os.path.join(output_dir, f"{final_name}.mlmodelc")
     if os.path.exists(target_path):
@@ -225,19 +211,13 @@ def bundle_resources_for_swift_cli(args):
 
     # Compile model using coremlcompiler (Significantly reduces the load time for unet)
     for source_name, target_name in [("text_encoder", "TextEncoder"),
-                                     ("text_encoder_2", "TextEncoder2"),
-                                     ("vae_decoder", "VAEDecoder"),
-                                     ("vae_encoder", "VAEEncoder"),
-                                     ("unet", "Unet"),
-                                     ("unet_chunk1", "UnetChunk1"),
-                                     ("unet_chunk2", "UnetChunk2"),
-                                     ("refiner", "UnetRefiner"),
-                                     ("refiner_chunk1", "UnetRefinerChunk1"),
-                                     ("refiner_chunk2", "UnetRefinerChunk2"),
-                                     ("control-unet", "ControlledUnet"),
-                                     ("control-unet_chunk1", "ControlledUnetChunk1"),
-                                     ("control-unet_chunk2", "ControlledUnetChunk2"),
-                                     ("safety_checker", "SafetyChecker")]:
+                                     ("vqgan_decoder", "VQGANDecoder"),
+                                     ("decoder", "Decoder"),
+                                     ("decoder_chunk1", "DecoderChunk1"),
+                                     ("decoder_chunk2", "DecoderChunk2"),
+                                     ("prior", "PriorRefiner"),
+                                     ("prior_chunk1", "PriorChunk1"),
+                                     ("prior_chunk2", "PriorChunk2")]:
         source_path = _get_out_path(args, source_name)
         if os.path.exists(source_path):
             target_path = _compile_coreml_model(source_path, resources_dir,
@@ -247,7 +227,7 @@ def bundle_resources_for_swift_cli(args):
             logger.warning(
                 f"{source_path} not found, skipping compilation to {target_name}.mlmodelc"
             )
-            
+
     if args.convert_controlnet:
         for controlnet_model_version in args.convert_controlnet:
             controlnet_model_name = controlnet_model_version.replace("/", "_")
@@ -280,11 +260,10 @@ def bundle_resources_for_swift_cli(args):
     return resources_dir
 
 
-from transformers.models.clip import modeling_clip
-
-# Copied from https://github.com/huggingface/transformers/blob/v4.30.0/src/transformers/models/clip/modeling_clip.py#L677C1-L692C1
 def patched_make_causal_mask(input_ids_shape, dtype, device, past_key_values_length: int = 0):
-    """ Patch to replace torch.finfo(dtype).min with -1e4
+    """
+    Patch to replace torch.finfo(dtype).min with -1e4.
+    Copied from https://github.com/huggingface/transformers/blob/v4.30.0/src/transformers/models/clip/modeling_clip.py#L677C1-L692C1
     """
     bsz, tgt_len = input_ids_shape
     mask = torch.full((tgt_len, tgt_len), torch.tensor(-1e4, device=device), device=device)
@@ -293,13 +272,16 @@ def patched_make_causal_mask(input_ids_shape, dtype, device, past_key_values_len
     mask = mask.to(dtype)
 
     if past_key_values_length > 0:
-        mask = torch.cat([torch.zeros(tgt_len, past_key_values_length, dtype=dtype, device=device), mask], dim=-1)
+        mask = torch.cat([torch.zeros(tgt_len, past_key_values_length,
+                                      dtype=dtype, device=device), mask], dim=-1)
     return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
 
 modeling_clip._make_causal_mask = patched_make_causal_mask
 
+
 def convert_text_encoder(text_encoder, tokenizer, submodule_name, args):
-    """ Converts the text encoder component of Stable Cascade
+    """
+    Converts the text encoder component of Stable Cascade.
     """
     text_encoder = text_encoder.to(dtype=torch.float32)
     out_path = _get_out_path(args, submodule_name)
@@ -327,8 +309,10 @@ def convert_text_encoder(text_encoder, tokenizer, submodule_name, args):
     }
     logger.info(f"Sample inputs spec: {sample_text_encoder_inputs_spec}")
 
-    class TextEncoder(nn.Module):
-
+    class TextEncoder(torch.nn.Module):
+        """
+        TextEncoder.
+        """
         def __init__(self, with_hidden_states_for_layer=None):
             super().__init__()
             self.text_encoder = text_encoder
@@ -340,10 +324,8 @@ def convert_text_encoder(text_encoder, tokenizer, submodule_name, args):
                 hidden_embeds = output.hidden_states[self.with_hidden_states_for_layer]
                 if "text_embeds" in output:
                     return (hidden_embeds, output.text_embeds)
-                else:
-                    return (hidden_embeds, output.pooler_output)
-            else:
-                return self.text_encoder(input_ids, return_dict=False)
+                return (hidden_embeds, output.pooler_output)
+            return self.text_encoder(input_ids, return_dict=False)
 
     reference_text_encoder = TextEncoder(with_hidden_states_for_layer=None).eval()
 
@@ -354,8 +336,6 @@ def convert_text_encoder(text_encoder, tokenizer, submodule_name, args):
     )
     logger.info("Done.")
 
-    # if args.xl_version:
-    #     output_names = ["hidden_embeds", "pooled_outputs"]
     output_names = ["last_hidden_state", "pooled_outputs"]
     coreml_text_encoder, out_path = _convert_to_coreml(
         submodule_name, reference_text_encoder, sample_text_encoder_inputs,
@@ -363,8 +343,6 @@ def convert_text_encoder(text_encoder, tokenizer, submodule_name, args):
 
     # Set model metadata
     coreml_text_encoder.author = f"Please refer to the Model Card available at huggingface.co/{args.model_version}"
-    # if args.xl_version:
-    #     coreml_text_encoder.license = "OpenRAIL++-M (https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/blob/main/LICENSE.md)"
     coreml_text_encoder.license = "OpenRAIL (https://huggingface.co/stabilityai/stable-cascade/blob/main/LICENSE)"
     coreml_text_encoder.version = args.model_version
     coreml_text_encoder.short_description = \
@@ -376,9 +354,6 @@ def convert_text_encoder(text_encoder, tokenizer, submodule_name, args):
         "input_ids"] = "The token ids that represent the input text"
 
     # Set the output descriptions
-    # if args.xl_version:
-    #     coreml_text_encoder.output_description[
-    #         "hidden_embeds"] = "Hidden states after the encoder layers"
     coreml_text_encoder.output_description[
             "last_hidden_state"] = "The token embeddings as encoded by the Transformer model"
     coreml_text_encoder.output_description[
@@ -392,18 +367,14 @@ def convert_text_encoder(text_encoder, tokenizer, submodule_name, args):
     if args.check_output_correctness:
         baseline_out = text_encoder(
             sample_text_encoder_inputs["input_ids"].to(torch.int32),
-            # output_hidden_states=args.xl_version,
             return_dict=True,
         )
-        # if args.xl_version:
-        #     # TODO: maybe check pooled_outputs too
-        #     baseline_out = baseline_out.hidden_states[hidden_layer].numpy()
         baseline_out = baseline_out.last_hidden_state.numpy()
 
         coreml_out = coreml_text_encoder.predict(
             {k: v.numpy() for k, v in sample_text_encoder_inputs.items()}
         )
-        coreml_out = coreml_out["hidden_embeds" if args.xl_version else "last_hidden_state"]
+        coreml_out = coreml_out["last_hidden_state"]
         report_correctness(
             baseline_out, coreml_out,
             "text_encoder baseline PyTorch to reference CoreML")
@@ -414,7 +385,8 @@ def convert_text_encoder(text_encoder, tokenizer, submodule_name, args):
 
 def modify_coremltools_torch_frontend_badbmm():
     """
-    Modifies coremltools torch frontend for baddbmm to be robust to the `beta` argument being of non-float dtype:
+    Modifies coremltools torch frontend for baddbmm to be robust to the `beta`
+    argument being of non-float dtype:
     e.g. https://github.com/huggingface/diffusers/blob/v0.8.1/src/diffusers/models/attention.py#L315
     """
     from coremltools.converters.mil import register_torch_op
@@ -461,9 +433,10 @@ def modify_coremltools_torch_frontend_badbmm():
 
 
 def convert_vqgan_decoder(pipe, args):
-    """ Converts the vqgan Decoder component of Stable Cascade
     """
-    out_path = _get_out_path(args, "vae_decoder")
+    Converts the VQGAN Decoder component of Stable Cascade.
+    """
+    out_path = _get_out_path(args, "vqgan_decoder")
     if os.path.exists(out_path):
         logger.info(
             f"`vqgan_decoder` already exists at {out_path}, skipping conversion."
@@ -476,18 +449,12 @@ def convert_vqgan_decoder(pipe, args):
             "Please use convert_vae_decoder() before convert_unet()")
 
     z_shape = (
-        1,  # B
-        pipe.vqgan.config.latent_channels,  # C
+        1,                                    # B
+        pipe.vqgan.config.latent_channels,    # C
         args.latent_h or round(SAMPLE_SIZE),  # H
         args.latent_w or round(SAMPLE_SIZE),  # W
     )
 
-    # if args.custom_vae_version is None and args.xl_version:
-    #     inputs_dtype = torch.float32
-    #     compute_precision = ct.precision.FLOAT32
-    #     # FIXME: Hardcoding to CPU_AND_GPU since ANE doesn't support FLOAT32
-    #     compute_unit = ct.ComputeUnit.CPU_AND_GPU
-    # else:
     inputs_dtype = torch.float16
     compute_precision = None
     compute_unit = None
@@ -496,8 +463,9 @@ def convert_vqgan_decoder(pipe, args):
         "z": torch.rand(*z_shape, dtype=inputs_dtype)
     }
 
-    class VQGANDecoder(nn.Module):
-        """ Wrapper nn.Module wrapper for pipe.decode() method
+    class VQGANDecoder(torch.nn.Module):
+        """
+        Wrapper nn.Module wrapper for pipe.decode() method.
         """
 
         def __init__(self):
@@ -521,8 +489,6 @@ def convert_vqgan_decoder(pipe, args):
 
     # Set model metadata
     coreml_vqgan_decoder.author = f"Please refer to the Model Card available at huggingface.co/{args.model_version}"
-    # if args.xl_version:
-    #     coreml_vqgan_decoder.license = "OpenRAIL++-M (https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/blob/main/LICENSE.md)"
     coreml_vqgan_decoder.license = "OpenRAIL (https://huggingface.co/stabilityai/stable-cascade/blob/main/LICENSE)"
     coreml_vqgan_decoder.version = args.model_version
     coreml_vqgan_decoder.short_description = \
@@ -555,10 +521,161 @@ def convert_vqgan_decoder(pipe, args):
     gc.collect()
 
 
-def convert_decoder(pipe, args, model_name = None):
-    """ Converts the UNet component of Stable Diffusion
+def convert_prior(pipe, args, model_name = None):
     """
-    decoder_name = model_name or "prior_prior"
+    Converts the prior stage of the Stable Cascade.
+    """
+    prior_name = model_name or "prior_prior"
+
+    out_path = _get_out_path(args, prior_name)
+
+    # Check if Unet was previously exported and then chunked
+    prior_chunks_exist = all(
+        os.path.exists(out_path.replace(".mlpackage", f"_chunk{idx+1}.mlpackage"))
+        for idx in range(2))
+
+    if args.chunk_prior and prior_chunks_exist:
+        logger.info("`prior` chunks already exist, skipping conversion.")
+        del pipe.prior_prior
+        gc.collect()
+        return
+
+    if not os.path.exists(out_path):
+        # Prepare sample input shapes and values
+        batch_size = 2  # for classifier-free guidance
+        sample_shape = (
+            batch_size,                           # B
+            pipe.prior_prior.config.in_channels,  # C
+            args.latent_h or round(SAMPLE_SIZE),  # H
+            args.latent_w or round(SAMPLE_SIZE),  # W
+        )
+
+        if not hasattr(pipe, "text_encoder"):
+            raise RuntimeError(
+                "convert_text_encoder() deletes pipe.text_encoder to save RAM. "
+                "Please use convert_prior() before convert_text_encoder()")
+
+        if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
+            hidden_size = pipe.prior_text_encoder.config.hidden_size
+
+        clip_text_pooled_shape = (
+            batch_size,
+            1,
+            args.text_encoder_hidden_size or hidden_size,
+        )
+
+        # Create the scheduled timesteps for downstream use
+        pipe.scheduler.set_timesteps(DEFAULT_NUM_INFERENCE_STEPS)
+
+        sample_prior_inputs = OrderedDict([
+            ("sample", torch.rand(*sample_shape)),
+            ("timestep",
+             torch.tensor([pipe.scheduler.timesteps[0].item()] *
+                          (batch_size)).to(torch.float32)),
+            ("clip_text_pooled", torch.rand(*clip_text_pooled_shape))
+        ])
+
+        # Prepare inputs
+        baseline_sample_prior_inputs = deepcopy(sample_prior_inputs)
+        baseline_sample_prior_inputs[
+            "clip_text_pooled"] = baseline_sample_prior_inputs[
+                "clip_text_pooled"].squeeze(2).transpose(1, 2)
+
+        # Initialize reference unet
+        reference_prior = StableCascadeUNet(**pipe.prior_prior.config).eval()
+
+        sample_prior_inputs_spec = {
+            k: (v.shape, v.dtype)
+            for k, v in sample_prior_inputs.items()
+        }
+        logger.info(f"Sample prior inputs spec: {sample_prior_inputs_spec}")
+
+        # JIT trace
+        logger.info("JIT tracing..")
+        reference_prior = torch.jit.trace(reference_prior,
+                                         list(sample_prior_inputs.values()))
+        logger.info("Done.")
+
+        if args.check_output_correctness:
+            baseline_out = pipe.prior_prior.to(torch.float32)(**baseline_sample_prior_inputs,
+                                     return_dict=False)[0].numpy()
+            reference_out = reference_prior(*sample_prior_inputs.values())[0].numpy()
+            report_correctness(baseline_out, reference_out,
+                               "prior baseline to reference PyTorch")
+
+        del pipe.prior_prior
+        gc.collect()
+
+        coreml_sample_prior_inputs = {
+            k: v.numpy().astype(np.float16)
+            for k, v in sample_prior_inputs.items()
+        }
+
+        coreml_prior, out_path = _convert_to_coreml(prior_name, reference_prior,
+                                                   coreml_sample_prior_inputs,
+                                                   ["noise_pred"], args)
+        del reference_prior
+        gc.collect()
+
+        # Set model metadata
+        coreml_prior.author = f"Please refer to the Model Card available at huggingface.co/{args.model_version}"
+        coreml_prior.license = "OpenRAIL (https://huggingface.co/stabilityai/stable-cascade/blob/main/LICENSE)"
+        coreml_prior.version = args.model_version
+        coreml_prior.short_description = \
+            "Stable Cascade generates images conditioned on text or other images as input through the Wurstchen architecture. " \
+            "Please refer to https://openreview.net/forum?id=gU58d5QeGv for details."
+
+        # Set the input descriptions
+        coreml_prior.input_description["sample"] = \
+            "The low resolution latent feature maps being denoised through reverse diffusion"
+        coreml_prior.input_description["timestep"] = \
+            "A value emitted by the associated scheduler object to condition the model on a given noise schedule"
+        coreml_prior.input_description["clip_text_pooled"] = \
+            "Output embeddings from the associated text_encoder model to condition to generated image on text. " \
+            "A maximum of 77 tokens (~40 words) are allowed. Longer text is truncated. " \
+            "Shorter text does not reduce computation."
+
+        # Set the output descriptions
+        coreml_prior.output_description["noise_pred"] = \
+            "Same shape and dtype as the `sample` input. " \
+            "The predicted noise to facilitate the reverse diffusion (denoising) process"
+
+        # Set package version metadata
+        from python_coreml_stable_cascade._version import __version__
+        coreml_prior.user_defined_metadata["stable-cascade.version"] = __version__
+        # coreml_prior.user_defined_metadata["com.github.apple.ml-stable-diffusion.version"] = __version__
+
+        coreml_prior.save(out_path)
+        logger.info(f"Saved prior into {out_path}")
+
+        # Parity check PyTorch vs CoreML
+        if args.check_output_correctness:
+            coreml_out = list(
+                coreml_prior.predict(coreml_sample_prior_inputs).values())[0]
+            report_correctness(baseline_out, coreml_out,
+                               "prior baseline PyTorch to reference CoreML")
+
+        del coreml_prior
+        gc.collect()
+    else:
+        del pipe.prior_prior
+        gc.collect()
+        logger.info(
+            f"`prior` already exists at {out_path}, skipping conversion.")
+
+    if args.chunk_prior and not prior_chunks_exist:
+        logger.info(f"Chunking {model_name} in two approximately equal MLModels")
+        args.mlpackage_path = out_path
+        args.remove_original = False
+        args.merge_chunks_in_pipeline_model = False
+        python_coreml_stable_cascade.chunk_mlprogram.main(args)
+
+
+def convert_decoder(pipe, args, model_name = None):
+    """
+    Converts the decoder stage of the Stable Cascade.
+    """
+    decoder_name = model_name or "decoder"
 
     out_path = _get_out_path(args, decoder_name)
 
@@ -569,28 +686,26 @@ def convert_decoder(pipe, args, model_name = None):
 
     if args.chunk_decoder and decoder_chunks_exist:
         logger.info("`decoder` chunks already exist, skipping conversion.")
-        del pipe.prior_prior
+        del pipe.decoder
         gc.collect()
         return
 
-    # If original Unet does not exist, export it from PyTorch+diffusers
     if not os.path.exists(out_path):
         # Prepare sample input shapes and values
         batch_size = 2  # for classifier-free guidance
         sample_shape = (
-            batch_size,                       # B
-            pipe.prior_prior.config.in_channels,  # C
-            args.latent_h or round(SAMPLE_SIZE),     # H
-            args.latent_w or round(SAMPLE_SIZE),     # W
+            batch_size,                           # B
+            pipe.decoder.config.in_channels,      # C
+            args.latent_h or round(SAMPLE_SIZE),  # H
+            args.latent_w or round(SAMPLE_SIZE),  # W
         )
 
         if not hasattr(pipe, "text_encoder"):
             raise RuntimeError(
                 "convert_text_encoder() deletes pipe.text_encoder to save RAM. "
-                "Please use convert_unet() before convert_text_encoder()")
+                "Please use convert_decoder() before convert_text_encoder()")
 
         if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
-            text_token_sequence_length = pipe.text_encoder.config.max_position_embeddings
             hidden_size = pipe.text_encoder.config.hidden_size
 
         clip_text_pooled_shape = (
@@ -600,7 +715,6 @@ def convert_decoder(pipe, args, model_name = None):
         )
 
         # Create the scheduled timesteps for downstream use
-        DEFAULT_NUM_INFERENCE_STEPS = 30
         pipe.scheduler.set_timesteps(DEFAULT_NUM_INFERENCE_STEPS)
 
         sample_decoder_inputs = OrderedDict([
@@ -612,58 +726,18 @@ def convert_decoder(pipe, args, model_name = None):
         ])
 
         # Prepare inputs
-        # baseline_sample_decoder_inputs = deepcopy(sample_decoder_inputs)
-        # baseline_sample_decoder_inputs[
-        #     "encoder_hidden_states"] = baseline_sample_decoder_inputs[
-        #         "encoder_hidden_states"].squeeze(2).transpose(1, 2)
+        baseline_sample_decoder_inputs = deepcopy(sample_decoder_inputs)
+        baseline_sample_decoder_inputs[
+            "clip_text_pooled"] = baseline_sample_decoder_inputs[
+                "clip_text_pooled"].squeeze(2).transpose(1, 2)
 
         # Initialize reference unet
-        # unet_cls = unet.UNet2DConditionModel
-        # decoder_cls = stable_cascade_unet.StableCascadeUNet
         decoder_cls = StableCascadeUNet
 
-        reference_decoder = decoder_cls(**pipe.prior_prior.config).eval()
+        # Returning <patch_size> back to default value set in StableCascadeUNet
+        pipe.decoder.config["patch_size"] = 1
 
-        # load_state_dict_summary = reference_unet.load_state_dict(
-        #     pipe.unet.state_dict())
-
-        # if args.unet_support_controlnet:
-        #     from .unet import calculate_conv2d_output_shape
-        #     additional_residuals_shapes = []
-
-        #     # conv_in
-        #     out_h, out_w = calculate_conv2d_output_shape(
-        #         (args.latent_h or pipe.unet.config.sample_size),
-        #         (args.latent_w or pipe.unet.config.sample_size),
-        #         reference_unet.conv_in,
-        #     )
-        #     additional_residuals_shapes.append(
-        #         (batch_size, reference_unet.conv_in.out_channels, out_h, out_w))
-            
-        #     # down_blocks
-        #     for down_block in reference_unet.down_blocks:
-        #         additional_residuals_shapes += [
-        #             (batch_size, resnet.out_channels, out_h, out_w) for resnet in down_block.resnets
-        #         ]
-        #         if hasattr(down_block, "downsamplers") and down_block.downsamplers is not None:
-        #             for downsampler in down_block.downsamplers:
-        #                 out_h, out_w = calculate_conv2d_output_shape(out_h, out_w, downsampler.conv)
-        #             additional_residuals_shapes.append(
-        #                 (batch_size, down_block.downsamplers[-1].conv.out_channels, out_h, out_w))
-            
-        #     # mid_block
-        #     additional_residuals_shapes.append(
-        #         (batch_size, reference_unet.mid_block.resnets[-1].out_channels, out_h, out_w)
-        #     )
-
-        #     baseline_sample_unet_inputs["down_block_additional_residuals"] = ()
-        #     for i, shape in enumerate(additional_residuals_shapes):
-        #         sample_residual_input = torch.rand(*shape)
-        #         sample_decoder_inputs[f"additional_residual_{i}"] = sample_residual_input
-        #         if i == len(additional_residuals_shapes) - 1:
-        #             baseline_sample_unet_inputs["mid_block_additional_residual"] = sample_residual_input
-        #         else:
-        #             baseline_sample_unet_inputs["down_block_additional_residuals"] += (sample_residual_input, )
+        reference_decoder = decoder_cls(**pipe.decoder.config).eval()
 
         sample_decoder_inputs_spec = {
             k: (v.shape, v.dtype)
@@ -677,14 +751,14 @@ def convert_decoder(pipe, args, model_name = None):
                                          list(sample_decoder_inputs.values()))
         logger.info("Done.")
 
-        # if args.check_output_correctness:
-        #     baseline_out = pipe.prior_prior.to(torch.float32)(**baseline_sample_decoder_inputs,
-        #                              return_dict=False)[0].numpy()
-        #     reference_out = reference_decoder(*sample_decoder_inputs.values())[0].numpy()
-        #     report_correctness(baseline_out, reference_out,
-        #                        "decoder baseline to reference PyTorch")
+        if args.check_output_correctness:
+            baseline_out = pipe.decoder.to(torch.float32)(**baseline_sample_decoder_inputs,
+                                     return_dict=False)[0].numpy()
+            reference_out = reference_decoder(*sample_decoder_inputs.values())[0].numpy()
+            report_correctness(baseline_out, reference_out,
+                               "decoder baseline to reference PyTorch")
 
-        del pipe.prior_prior
+        del pipe.decoder
         gc.collect()
 
         coreml_sample_decoder_inputs = {
@@ -701,12 +775,10 @@ def convert_decoder(pipe, args, model_name = None):
 
         # Set model metadata
         coreml_decoder.author = f"Please refer to the Model Card available at huggingface.co/{args.model_version}"
-        # if args.xl_version:
-        #     coreml_decoder.license = "OpenRAIL++-M (https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/blob/main/LICENSE.md)"
         coreml_decoder.license = "OpenRAIL (https://huggingface.co/stabilityai/stable-cascade/blob/main/LICENSE)"
         coreml_decoder.version = args.model_version
         coreml_decoder.short_description = \
-            "Stable Diffusion generates images conditioned on text or other images as input through the diffusion process. " \
+            "Stable Cascade generates images conditioned on text or other images as input through the Wurstchen architecture. " \
             "Please refer to https://openreview.net/forum?id=gU58d5QeGv for details."
 
         # Set the input descriptions
@@ -718,11 +790,6 @@ def convert_decoder(pipe, args, model_name = None):
             "Output embeddings from the associated text_encoder model to condition to generated image on text. " \
             "A maximum of 77 tokens (~40 words) are allowed. Longer text is truncated. " \
             "Shorter text does not reduce computation."
-        # if args.xl_version:
-        #     coreml_decoder.input_description["time_ids"] = \
-        #         "Additional embeddings that if specified are added to the embeddings that are passed along to the UNet blocks."
-        #     coreml_decoder.input_description["text_embeds"] = \
-        #         "Additional embeddings from text_encoder_2 that if specified are added to the embeddings that are passed along to the UNet blocks."
 
         # Set the output descriptions
         coreml_decoder.output_description["noise_pred"] = \
@@ -731,7 +798,8 @@ def convert_decoder(pipe, args, model_name = None):
 
         # Set package version metadata
         from python_coreml_stable_cascade._version import __version__
-        coreml_decoder.user_defined_metadata["com.github.apple.ml-stable-diffusion.version"] = __version__
+        coreml_decoder.user_defined_metadata["stable-cascade.version"] = __version__
+        # coreml_decoder.user_defined_metadata["com.github.apple.ml-stable-diffusion.version"] = __version__
 
         coreml_decoder.save(out_path)
         logger.info(f"Saved decoder into {out_path}")
@@ -741,7 +809,7 @@ def convert_decoder(pipe, args, model_name = None):
             coreml_out = list(
                 coreml_decoder.predict(coreml_sample_decoder_inputs).values())[0]
             report_correctness(baseline_out, coreml_out,
-                               "unet baseline PyTorch to reference CoreML")
+                               "decoder baseline PyTorch to reference CoreML")
 
         del coreml_decoder
         gc.collect()
@@ -756,181 +824,8 @@ def convert_decoder(pipe, args, model_name = None):
         args.mlpackage_path = out_path
         args.remove_original = False
         args.merge_chunks_in_pipeline_model = False
-        # chunk_mlprogram.main(args)
         python_coreml_stable_cascade.chunk_mlprogram.main(args)
 
-# def _get_controlnet_base_model(controlnet_model_version):
-#     from huggingface_hub import model_info
-#     info = model_info(controlnet_model_version)
-#     return info.cardData.get("base_model", None)
-
-# def convert_controlnet(pipe, args):
-#     """ Converts each ControlNet for Stable Diffusion
-#     """
-#     if not hasattr(pipe, "unet"):
-#         raise RuntimeError(
-#             "convert_unet() deletes pipe.unet to save RAM. "
-#             "Please use convert_vae_encoder() before convert_unet()")
-
-#     if not hasattr(pipe, "text_encoder"):
-#             raise RuntimeError(
-#                 "convert_text_encoder() deletes pipe.text_encoder to save RAM. "
-#                 "Please use convert_unet() before convert_text_encoder()")
-
-#     for i, controlnet_model_version in enumerate(args.convert_controlnet):
-#         base_model = _get_controlnet_base_model(controlnet_model_version)
-
-#         if base_model is None and args.model_version != "runwayml/stable-diffusion-v1-5":
-#             logger.warning(
-#                 f"The original ControlNet models were trained using Stable Diffusion v1.5. "
-#                 f"It is possible that model {args.model_version} is not compatible with controlnet.")
-#         if base_model is not None and base_model != args.model_version:
-#             raise RuntimeError(
-#                 f"ControlNet model {controlnet_model_version} was trained using "
-#                 f"Stable Diffusion model {base_model}.\n However, you specified "
-#                 f"version {args.model_version} in the command line. Please, use "
-#                 f"--model-version {base_model} to convert this model.")
-
-#         controlnet_model_name = controlnet_model_version.replace("/", "_")
-#         fname = f"ControlNet_{controlnet_model_name}.mlpackage"
-#         out_path = os.path.join(args.o, fname)
-
-#         if os.path.exists(out_path):
-#             logger.info(
-#                 f"`controlnet_{controlnet_model_name}` already exists at {out_path}, skipping conversion."
-#             )
-#             continue
-
-#         if i == 0:
-#             batch_size = 2  # for classifier-free guidance
-#             sample_shape = (
-#                 batch_size,                    # B
-#                 pipe.unet.config.in_channels,  # C
-#                 (args.latent_h or pipe.unet.config.sample_size),  # H
-#                 (args.latent_w or pipe.unet.config.sample_size),  # W
-#             )
-
-#             encoder_hidden_states_shape = (
-#                 batch_size,
-#                 args.text_encoder_hidden_size or pipe.text_encoder.config.hidden_size,
-#                 1,
-#                 args.text_token_sequence_length or pipe.text_encoder.config.max_position_embeddings,
-#             )
-
-#             controlnet_cond_shape = (
-#                 batch_size,                                           # B
-#                 3,                                                    # C
-#                 (args.latent_h or pipe.unet.config.sample_size) * 8,  # H
-#                 (args.latent_w or pipe.unet.config.sample_size) * 8,  # w
-#             )
-
-#             # Create the scheduled timesteps for downstream use
-#             DEFAULT_NUM_INFERENCE_STEPS = 50
-#             pipe.scheduler.set_timesteps(DEFAULT_NUM_INFERENCE_STEPS)
-
-#             # Prepare inputs
-#             sample_controlnet_inputs = OrderedDict([
-#                 ("sample", torch.rand(*sample_shape)),
-#                 ("timestep",
-#                 torch.tensor([pipe.scheduler.timesteps[0].item()] *
-#                              (batch_size)).to(torch.float32)),
-#                 ("encoder_hidden_states", torch.rand(*encoder_hidden_states_shape)),
-#                 ("controlnet_cond", torch.rand(*controlnet_cond_shape)),
-#             ])
-#             sample_controlnet_inputs_spec = {
-#                 k: (v.shape, v.dtype)
-#                 for k, v in sample_controlnet_inputs.items()
-#             }
-#             logger.info(
-#                 f"Sample ControlNet inputs spec: {sample_controlnet_inputs_spec}")
-
-#             baseline_sample_controlnet_inputs = deepcopy(sample_controlnet_inputs)
-#             baseline_sample_controlnet_inputs[
-#                 "encoder_hidden_states"] = baseline_sample_controlnet_inputs[
-#                     "encoder_hidden_states"].squeeze(2).transpose(1, 2)
-
-#         # Import controlnet model and initialize reference controlnet
-#         original_controlnet = ControlNetModel.from_pretrained(
-#             controlnet_model_version,
-#             use_auth_token=True
-#         )
-#         reference_controlnet = controlnet.ControlNetModel(**original_controlnet.config).eval()
-#         load_state_dict_summary = reference_controlnet.load_state_dict(
-#             original_controlnet.state_dict())
-
-#         num_residuals = reference_controlnet.get_num_residuals()
-#         output_keys = [f"additional_residual_{i}" for i in range(num_residuals)]
-
-#         # JIT trace
-#         logger.info("JIT tracing..")
-#         reference_controlnet = torch.jit.trace(reference_controlnet,
-#                                          list(sample_controlnet_inputs.values()))
-#         logger.info("Done.")
-
-#         if args.check_output_correctness:
-#             baseline_out = original_controlnet(**baseline_sample_controlnet_inputs,
-#                                      return_dict=False)
-#             reference_out = reference_controlnet(*sample_controlnet_inputs.values())
-#             report_correctness(
-#                 baseline_out[-1].numpy(),
-#                 reference_out[-1].numpy(),
-#                 f"{controlnet_model_name} baseline to reference PyTorch")
-
-#         del original_controlnet
-#         gc.collect()
-
-#         coreml_sample_controlnet_inputs = {
-#             k: v.numpy().astype(np.float16)
-#             for k, v in sample_controlnet_inputs.items()
-#         }
-
-#         coreml_controlnet, out_path = _convert_to_coreml(f"controlnet_{controlnet_model_name}", reference_controlnet,
-#                                                    coreml_sample_controlnet_inputs,
-#                                                    output_keys, args,
-#                                                    out_path=out_path)
-
-#         del reference_controlnet
-#         gc.collect()
-
-#         coreml_controlnet.author = f"Please refer to the Model Card available at huggingface.co/{controlnet_model_version}"
-#         coreml_controlnet.license = "OpenRAIL (https://huggingface.co/spaces/CompVis/stable-diffusion-license)"
-#         coreml_controlnet.version = controlnet_model_version
-#         coreml_controlnet.short_description = \
-#             "ControlNet is a neural network structure to control diffusion models by adding extra conditions. " \
-#             "Please refer to https://arxiv.org/abs/2302.05543 for details."
-
-#         # Set the input descriptions
-#         coreml_controlnet.input_description["sample"] = \
-#             "The low resolution latent feature maps being denoised through reverse diffusion"
-#         coreml_controlnet.input_description["timestep"] = \
-#             "A value emitted by the associated scheduler object to condition the model on a given noise schedule"
-#         coreml_controlnet.input_description["encoder_hidden_states"] = \
-#             "Output embeddings from the associated text_encoder model to condition to generated image on text. " \
-#             "A maximum of 77 tokens (~40 words) are allowed. Longer text is truncated. " \
-#             "Shorter text does not reduce computation."
-#         coreml_controlnet.input_description["controlnet_cond"] = \
-#             "An additional input image for ControlNet to condition the generated images."
-
-#         # Set the output descriptions
-#         for i in range(num_residuals):
-#             coreml_controlnet.output_description[f"additional_residual_{i}"] = \
-#                 "One of the outputs of each downsampling block in ControlNet. " \
-#                 "The value added to the corresponding resnet output in UNet."
-
-#         coreml_controlnet.save(out_path)
-#         logger.info(f"Saved controlnet into {out_path}")
-
-#         # Parity check PyTorch vs CoreML
-#         if args.check_output_correctness:
-#             coreml_out = coreml_controlnet.predict(coreml_sample_controlnet_inputs)
-#             report_correctness(
-#                 baseline_out[-1].numpy(),
-#                 coreml_out[output_keys[-1]],
-#                 "controlnet baseline PyTorch to reference CoreML"
-#             )
-
-#         del coreml_controlnet
-#         gc.collect()
 
 def get_pipeline(args):
     model_version = args.model_version
@@ -954,30 +849,24 @@ def main(args):
     # Instantiate diffusers pipe as reference
     pipe = get_pipeline(args)
 
-    # Register the selected attention implementation globally
-    # unet.ATTENTION_IMPLEMENTATION_IN_EFFECT = unet.AttentionImplementations[
-    #     args.attention_implementation]
-    # logger.info(
-    #     f"Attention implementation in effect: {unet.ATTENTION_IMPLEMENTATION_IN_EFFECT}"
-    # )
-
     # Convert models
     if args.convert_vqgan_decoder:
         logger.info("Converting vqgan_decoder")
         convert_vqgan_decoder(pipe, args)
         logger.info("Converted vqgan_decoder")
 
-    # if args.convert_controlnet:
-    #     logger.info("Converting controlnet")
-    #     convert_controlnet(pipe, args)
-    #     logger.info("Converted controlnet")
+    if args.convert_prior:
+        logger.info("Converting prior")
+        convert_prior(pipe, args)
+        logger.info("Converted prior")
 
     if args.convert_decoder:
         logger.info("Converting decoder")
         convert_decoder(pipe, args)
         logger.info("Converted decoder")
 
-    if args.convert_text_encoder and hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
+    if args.convert_text_encoder and \
+        hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
         logger.info("Converting text_encoder")
         convert_text_encoder(pipe.text_encoder, pipe.tokenizer, "text_encoder", args)
         del pipe.text_encoder
@@ -993,6 +882,8 @@ def main(args):
         bundle_resources_for_swift_cli(args)
         logger.info("Bundled resources for the Swift CLI")
 
+    logger.info("Converted prior")
+
 
 def parser_spec():
     parser = argparse.ArgumentParser()
@@ -1001,18 +892,11 @@ def parser_spec():
     parser.add_argument("--convert-text-encoder", action="store_true")
     parser.add_argument("--convert-vqgan-decoder", action="store_true")
     parser.add_argument("--convert-decoder", action="store_true")
-    parser.add_argument(
-        "--convert-controlnet", 
-        nargs="*",
-        type=str,
-        help=
-        "Converts a ControlNet model hosted on HuggingFace to coreML format. " \
-        "To convert multiple models, provide their names separated by spaces.",
-    )
+    parser.add_argument("--convert-prior", action="store_true")
     parser.add_argument(
         "--model-version",
         required=True,
-        help="The pre-trained model checkpoint and configuration to restore. "
+        help="The pre-trained model checkpoint and configuration to restore."
     )
     parser.add_argument("--compute-unit",
                         choices=tuple(cu for cu in ct.ComputeUnit._member_names_),
@@ -1022,35 +906,21 @@ def parser_spec():
         type=int,
         default=None,
         help=
-        "The spatial resolution (number of rows) of the latent space. `Defaults to pipe.unet.config.sample_size`",
-    )
+        "The spatial resolution (number of rows) of the latent space. \
+`Defaults to round(SAMPLE_SIZE)`")
     parser.add_argument(
         "--latent-w",
         type=int,
         default=None,
         help=
-        "The spatial resolution (number of cols) of the latent space. `Defaults to pipe.unet.config.sample_size`",
-    )
-    parser.add_argument(
-        "--text-token-sequence-length",
-        type=int,
-        default=None,
-        help=
-        "The token sequence length for the text encoder. `Defaults to pipe.text_encoder.config.max_position_embeddings`",
-    )
+        "The spatial resolution (number of cols) of the latent space. \
+`Defaults to round(SAMPLE_SIZE)`")
     parser.add_argument(
         "--text-encoder-hidden-size",
         type=int,
         default=None,
         help=
-        "The hidden size for the text encoder. `Defaults to pipe.text_encoder.config.hidden_size`",
-    )
-    # parser.add_argument(
-    #     "--attention-implementation",
-    #     choices=tuple(ai for ai in unet.AttentionImplementations._member_names_),
-    #     default=unet.ATTENTION_IMPLEMENTATION_IN_EFFECT.name,
-    #     help="The enumerated implementations trade off between ANE and GPU performance",
-    # )
+        "The hidden size for the text encoder. `Defaults to pipe.text_encoder.config.hidden_size`")
     parser.add_argument(
         "-o",
         default=os.getcwd(),
@@ -1059,28 +929,45 @@ def parser_spec():
         "--check-output-correctness",
         action="store_true",
         help=
-        "If specified, compares the outputs of original PyTorch and final CoreML models and reports PSNR in dB. "
-        "Enabling this feature uses more memory. Disable it if your machine runs out of memory."
-        )
+        "If specified, compares the outputs of original PyTorch and final \
+CoreML models and reports PSNR in dB. Enabling this feature uses more memory. \
+Disable it if your machine runs out of memory.")
+    parser.add_argument(
+        "--chunk-prior",
+        action="store_true",
+        help=
+        "If specified, generates 2 mlpackages out of the prior model which \
+approximately equal weights sizes. \
+This is required for ANE deployment on iOS and iPadOS. Not required for macOS.")
     parser.add_argument(
         "--chunk-decoder",
         action="store_true",
         help=
-        "If specified, generates two mlpackages out of the unet model which approximately equal weights sizes. "
-        "This is required for ANE deployment on iOS and iPadOS. Not required for macOS."
-        )
+        "If specified, generates 2 mlpackages out of the decoder model which \
+approximately equal weights sizes. \
+This is required for ANE deployment on iOS and iPadOS. Not required for macOS.")
     parser.add_argument(
         "--quantize-nbits",
         default=None,
         choices=(1, 2, 4, 6, 8),
         type=int,
-        help="If specified, quantized each model to nbits precision"
+        help="If specified, quantized each model to nbits precision")
+
+    # Swift CLI Resource Bundling
+    parser.add_argument(
+        "--bundle-resources-for-swift-cli",
+        action="store_true",
+        help=
+        "If specified, creates a resources directory compatible with the sample Swift CLI. "
+        "It compiles all four models and adds them to a StableDiffusionResources directory "
+        "along with a `vocab.json` and `merges.txt` for the text tokenizer"
     )
+
     return parser
 
 
 if __name__ == "__main__":
     parser = parser_spec()
-    args = parser.parse_args()
+    arguments = parser.parse_args()
 
-    main(args)
+    main(arguments)
