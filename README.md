@@ -58,7 +58,7 @@ Lastly, VQGAN's performance is highly optimized. Only 2 layer operations are han
 
 ![VQGAN](img/VQGAN.png)
 
-## Optimizations and future endeavors
+## Optimizations & future endeavors
 
 There are several ways to compress model weights. The first way is to store them more efficiently using a sparse matrix representation. This can be achieved by using a technique called pruning. Another way is to reduce the precision used to store the weights. This can be achieved by both quantization and palettization. However, both strategies are lossy, and generally less accurate than their uncompressed counterparts.
 
